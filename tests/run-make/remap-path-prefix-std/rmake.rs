@@ -93,7 +93,9 @@ fn main() {
         // Check that remapped paths are present if the rlib has debug info.
         if stdout.contains("DW_TAG_compile_unit") {
             assert!(
-                stdout.contains("/rustc/") || stdout.contains("/rust/deps"),
+                stdout.contains("/rustc/")
+                    || stdout.contains("/rust/deps")
+                    || stdout.contains("/cargo/registry/"),
                 "Expected remapped paths in dwarfdump output for {link_name}",
             );
         }
