@@ -2440,7 +2440,7 @@ fn test_split_off_cmp_panic_does_not_corrupt() {
     use core::cell::Cell;
     use core::cmp::Ordering;
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct K {
         val: i32,
         armed: Rc<Cell<bool>>,
@@ -2503,11 +2503,12 @@ fn test_split_off_cmp_panic_does_not_corrupt() {
 // number of comparisons).
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+#[cfg_attr(miri, ignore = "too slow")]
 fn test_split_off_cmp_panic_countdown_height_2() {
     use core::cell::Cell;
     use core::cmp::Ordering;
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct K {
         val: i32,
         armed: Rc<Cell<bool>>,

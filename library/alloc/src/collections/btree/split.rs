@@ -2,8 +2,14 @@ use core::alloc::Allocator;
 use core::borrow::Borrow;
 
 use super::node::ForceResult::*;
-use super::node::Root;
+use super::node::{Handle, Root};
 use super::search::SearchResult::*;
+
+/// Maximum height whose split path we record on the stack.
+///
+/// With `B = 6`, a height of 32 already exceeds the number of elements that
+/// can exist in a 64-bit address space.
+const MAX_SPLIT_HEIGHT: usize = 32;
 
 impl<K, V> Root<K, V> {
     /// Calculates the length of both trees that result from splitting up
@@ -31,6 +37,10 @@ impl<K, V> Root<K, V> {
     /// and if the ordering of `Q` corresponds to that of `K`.
     /// If `self` respects all `BTreeMap` tree invariants, then both
     /// `self` and the returned tree will respect those invariants.
+    ///
+    /// `Ord`/`Borrow` are invoked only while locating the split path, before
+    /// any key-value pair is moved. A panic in the comparator therefore leaves
+    /// `self` unchanged.
     pub(super) fn split_off<Q: ?Sized + Ord, A: Allocator + Clone>(
         &mut self,
         key: &Q,
@@ -40,25 +50,57 @@ impl<K, V> Root<K, V> {
         K: Borrow<Q>,
     {
         let left_root = self;
-        let mut right_root = Root::new_pillar(left_root.height(), alloc.clone());
+        let height = left_root.height();
+
+        // Pass 1: record the split edge at every level. `search_node` is the
+        // only call that invokes `Ord`/`Borrow` and can panic. The tree is
+        // not mutated yet, so a panic here leaves `self` intact.
+        let mut split_edges = [0usize; MAX_SPLIT_HEIGHT];
+        let mut depth = 0;
+        {
+            let mut node = left_root.reborrow();
+            loop {
+                assert!(
+                    depth < MAX_SPLIT_HEIGHT,
+                    "BTreeMap height exceeds split_off stack buffer"
+                );
+                let idx = match node.search_node(key) {
+                    // key is going to the right tree
+                    Found(kv) => kv.idx(),
+                    GoDown(edge) => edge.idx(),
+                };
+                split_edges[depth] = idx;
+                depth += 1;
+                match node.force() {
+                    Internal(internal) => {
+                        // SAFETY: `idx` came from `search_node` on this node.
+                        node = unsafe { Handle::new_edge(internal, idx) }.descend();
+                    }
+                    Leaf(_) => break,
+                }
+            }
+        }
+        debug_assert_eq!(depth, height + 1);
+
+        // Pass 2: replay the recorded edges. This does not invoke `Ord`.
+        let mut right_root = Root::new_pillar(height, alloc.clone());
         let mut left_node = left_root.borrow_mut();
         let mut right_node = right_root.borrow_mut();
 
-        loop {
-            let mut split_edge = match left_node.search_node(key) {
-                // key is going to the right tree
-                Found(kv) => kv.left_edge(),
-                GoDown(edge) => edge,
-            };
-
+        for level in 0..depth {
+            // SAFETY: `split_edges[level]` was produced by `search_node` on
+            // this level of the unmodified tree, so it is a valid edge index.
+            let mut split_edge = unsafe { Handle::new_edge(left_node, split_edges[level]) };
             split_edge.move_suffix(&mut right_node);
 
+            if level + 1 == depth {
+                break;
+            }
             match (split_edge.force(), right_node.force()) {
                 (Internal(edge), Internal(node)) => {
                     left_node = edge.descend();
                     right_node = node.first_edge().descend();
                 }
-                (Leaf(_), Leaf(_)) => break,
                 _ => unreachable!(),
             }
         }
