@@ -2428,6 +2428,156 @@ fn test_split_off_large_random_sorted() {
     assert!(right.into_iter().eq(data.into_iter().filter(|x| x.0 >= key)));
 }
 
+// Regression test for #158165: a comparator that panics partway through
+// `split_off` used to leave the map with a stale `length` after some entries
+// had already been moved into a temporary right-hand tree (which is then
+// dropped during unwind). Consuming iteration trusted that stale length and
+// could double-free. `split_off` now finishes all `Ord` searches before any
+// destructive move, so a panic in the comparator must leave `self` unchanged.
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_split_off_cmp_panic_does_not_corrupt() {
+    use core::cell::Cell;
+    use core::cmp::Ordering;
+
+    #[derive(Clone)]
+    struct K {
+        val: i32,
+        armed: Rc<Cell<bool>>,
+    }
+
+    impl PartialEq for K {
+        fn eq(&self, other: &Self) -> bool {
+            self.val == other.val
+        }
+    }
+    impl Eq for K {}
+    impl PartialOrd for K {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for K {
+        fn cmp(&self, other: &Self) -> Ordering {
+            if self.armed.get() && self.val == 6 && other.val == 0 {
+                panic!("cmp panic");
+            }
+            self.val.cmp(&other.val)
+        }
+    }
+
+    let armed = Rc::new(Cell::new(false));
+    let mut map = BTreeMap::new();
+    for i in (6..12).chain(0..6) {
+        map.insert(K { val: i, armed: armed.clone() }, Box::new(0u8));
+    }
+    assert_eq!(map.len(), MIN_INSERTS_HEIGHT_1);
+
+    armed.set(true);
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        drop(map.split_off(&K { val: 6, armed: armed.clone() }));
+    }))
+    .is_err();
+    armed.set(false);
+
+    assert!(panicked, "split_off should hit the panicking comparison");
+
+    // If length and structure disagree, forgetting the map avoids dropping a
+    // corrupted tree (which is how the original bug became a double-free).
+    let len = map.len();
+    let reachable = map.range(..).count();
+    if len != reachable {
+        mem::forget(map);
+        panic!("stale length after panicking split_off: len={len} reachable={reachable}");
+    }
+
+    assert_eq!(len, MIN_INSERTS_HEIGHT_1);
+    let keys: Vec<i32> = map.iter().map(|(k, _)| k.val).collect();
+    assert_eq!(keys, Vec::from_iter(0..12));
+    assert_eq!(map.into_iter().count(), MIN_INSERTS_HEIGHT_1);
+}
+
+// Same invariant, but panic after the Nth comparison during `split_off` on a
+// 3-level tree. Every comparison happens before any move, so any panic must
+// leave a consistent map (or `split_off` completes if N is larger than the
+// number of comparisons).
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn test_split_off_cmp_panic_countdown_height_2() {
+    use core::cell::Cell;
+    use core::cmp::Ordering;
+
+    #[derive(Clone)]
+    struct K {
+        val: i32,
+        armed: Rc<Cell<bool>>,
+        remaining: Rc<Cell<u32>>,
+    }
+
+    impl PartialEq for K {
+        fn eq(&self, other: &Self) -> bool {
+            self.val == other.val
+        }
+    }
+    impl Eq for K {}
+    impl PartialOrd for K {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for K {
+        fn cmp(&self, other: &Self) -> Ordering {
+            if self.armed.get() {
+                let left = self.remaining.get();
+                if left == 0 {
+                    panic!("cmp panic");
+                }
+                self.remaining.set(left - 1);
+            }
+            self.val.cmp(&other.val)
+        }
+    }
+
+    let armed = Rc::new(Cell::new(false));
+    let remaining = Rc::new(Cell::new(0));
+    let make_key = |val: i32| K { val, armed: armed.clone(), remaining: remaining.clone() };
+
+    for panic_after in 0..40 {
+        let mut map = BTreeMap::new();
+        for i in 0..MIN_INSERTS_HEIGHT_2 as i32 {
+            map.insert(make_key(i), ());
+        }
+        let original_len = map.len();
+
+        remaining.set(panic_after);
+        armed.set(true);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            drop(map.split_off(&make_key(MIN_INSERTS_HEIGHT_2 as i32 / 2)));
+        }));
+        armed.set(false);
+
+        match result {
+            Err(_) => {
+                let len = map.len();
+                let reachable = map.range(..).count();
+                if len != reachable {
+                    mem::forget(map);
+                    panic!(
+                        "stale length after panicking split_off (panic_after={panic_after}): len={len} reachable={reachable}"
+                    );
+                }
+                assert_eq!(len, original_len);
+                drop(map);
+            }
+            Ok(_) => {
+                // Countdown never hit; split completed. Invariants must hold
+                // under the now-disarmed comparator.
+                map.check();
+            }
+        }
+    }
+}
+
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_into_iter_drop_leak_height_0() {
